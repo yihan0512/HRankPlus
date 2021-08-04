@@ -2,7 +2,16 @@
 import torch.nn as nn
 import torch.nn.functional as F
 
+import ipdb
+
 def adapt_channel(compress_rate, num_layers):
+    '''
+    structure of compress_rate:
+    compress_rate[0]: cprate for conv1
+    compress_rate[1]: cprate for stage 1
+    compress_rate[2]: cprate for stage 2
+    compress_rate[3:]: cprate for each basic block in layer1, layer2 and layer3 
+    '''
 
     if num_layers==56:
         stage_repeat = [9, 9, 9]
@@ -10,6 +19,7 @@ def adapt_channel(compress_rate, num_layers):
     elif num_layers==110:
         stage_repeat = [18, 18, 18]
         stage_out_channel = [16] + [16] * 18 + [32] * 18 + [64] * 18
+    
 
     stage_oup_cprate = []
     stage_oup_cprate += [compress_rate[0]]
@@ -69,12 +79,12 @@ class BasicBlock(nn.Module):
         if stride != 1 or inplanes != planes:
             if stride!=1:
                 self.shortcut = LambdaLayer(
-                    lambda x: F.pad(x[:, :, ::2, ::2],
-                                    (0, 0, 0, 0, (planes-inplanes)//2, planes-inplanes-(planes-inplanes)//2), "constant", 0))
+                    lambda x: F.pad(x[:, :, ::2, ::2], (0, 0, 0, 0, (planes-inplanes)//2, planes-inplanes-(planes-inplanes)//2), "constant", 0)
+                    )
             else:
                 self.shortcut = LambdaLayer(
-                    lambda x: F.pad(x[:, :, :, :],
-                                    (0, 0, 0, 0, (planes-inplanes)//2, planes-inplanes-(planes-inplanes)//2), "constant", 0))
+                    lambda x: F.pad(x[:, :, :, :], (0, 0, 0, 0, (planes-inplanes)//2, planes-inplanes-(planes-inplanes)//2), "constant", 0)
+                    )
             #self.shortcut = LambdaLayer(
             #    lambda x: F.pad(x[:, :, ::2, ::2], (0, 0, 0, 0, planes//4, planes//4),"constant", 0))
 

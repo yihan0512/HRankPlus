@@ -1,3 +1,8 @@
+# A fork of HRankPlus
+
+---
+
+
 # An extension version of our CVPR 2020, oral: HRank: Filter Pruning using High-Rank Feature Map ([Link](https://128.84.21.199/abs/2002.10179))![]( https://visitor-badge.glitch.me/badge?page_id=lmbxmu.hrankplus).
 
 ### Prior code version can be found [here](https://github.com/lmbxmu/HRank).

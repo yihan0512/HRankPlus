@@ -20,7 +20,7 @@ from models.cifar10.vgg import vgg_16_bn
 from models.cifar10.resnet import resnet_56, resnet_110
 from models.cifar10.googlenet import googlenet, Inception
 from models.cifar10.densenet import densenet_40
-from models.cifar10.doublenet import doublenet_56_indep, doublenet_110
+from models.cifar10.doublenet import doublenet_56_indep, doublenet_56_indep_bottleneck, doublenet_110
 
 from data import cifar10
 import utils.common as utils
@@ -130,6 +130,17 @@ parser.add_argument(
     default='0',
     help='Select gpu to use')
 
+parser.add_argument(
+    '--ssl',
+    action='store_true',
+    help='use ssl loss or not')
+
+parser.add_argument(
+    '--lam',
+    type=float,
+    default=0.008,
+    help='coefficient for the ssl loss term')
+
 args = parser.parse_args()
 
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -212,7 +223,7 @@ def load_resnet_model(model, oristate_dict, layer):
     all_conv_weight = []
 
     prefix = args.rank_conv_prefix+'/rank_conv'
-    subfix = ".np"
+    subfix = ".npy"
 
     # load weights in 3 stages
     cnt=1
@@ -260,7 +271,6 @@ def load_resnet_model(model, oristate_dict, layer):
                     state_dict[name_base+conv_weight_name] = oriweight
                     last_select_index = None
 
-    ipdb.set_trace()
     # load the rest of the weight other than resnet stages
     for name, module in model.named_modules():
         name = name.replace('module.', '')
@@ -279,6 +289,116 @@ def load_resnet_model(model, oristate_dict, layer):
     model.load_state_dict(state_dict)
 
 def load_doublenet_model(model, oristate_dict, layer):
+    '''
+    load weights based on L1 metric on oristate_dict
+    '''
+    cfg = {
+        56: [9, 9, 9],
+        110: [18, 18, 18],
+    }
+
+    state_dict = model.state_dict()
+
+    current_cfg = cfg[layer]
+    last_select_index = None
+
+    all_conv_weight = []
+
+    prefix = args.rank_conv_prefix+'/rank_conv'
+    subfix = ".npy"
+
+    # load deepnet weights
+    cnt=1
+    for layer, num in enumerate(current_cfg):
+        layer_name = 'layer' + str(layer + 1) + '.'
+        for k in range(num):
+            for l in range(2):
+                cnt+=1
+                cov_id=cnt
+                br_name = 'br' + str(layer + 1) + '.0'
+                br_weight_name = br_name + '.weight'
+
+                # the conv1 of the 1st block of a stage
+                if k == 0 and l == 0:
+                    br_in_index = last_select_index
+
+                conv_name = layer_name + str(k) + '.conv' + str(l + 1)
+                conv_weight_name = conv_name + '.weight'
+                all_conv_weight.append(conv_weight_name)
+                oriweight = oristate_dict[conv_weight_name]
+                curweight =state_dict[name_base+conv_weight_name]
+                orifilter_num = oriweight.size(0)
+                currentfilter_num = curweight.size(0)
+
+                if orifilter_num != currentfilter_num:
+                    # logger.info('loading rank from: ' + prefix + str(cov_id) + subfix)
+                    rank = oriweight.norm(p=1, dim=[1,2,3]).cpu()
+                    select_index = np.argsort(rank)[orifilter_num - currentfilter_num:]  # preserved filter id
+                    select_index, _ = select_index.sort()
+
+                    if last_select_index is not None:
+                        for index_i, i in enumerate(select_index):
+                            for index_j, j in enumerate(last_select_index):
+                                state_dict[name_base+conv_weight_name][index_i][index_j] = \
+                                    oristate_dict[conv_weight_name][i][j]
+                    else:
+                        for index_i, i in enumerate(select_index):
+                            state_dict[name_base+conv_weight_name][index_i] = \
+                                oristate_dict[conv_weight_name][i]
+
+                    last_select_index = select_index
+
+                # alter each filter based on the prune result of the previous block
+                elif last_select_index is not None:
+                    for index_i in range(orifilter_num):
+                        for index_j, j in enumerate(last_select_index):
+                            state_dict[name_base+conv_weight_name][index_i][index_j] = \
+                                oristate_dict[conv_weight_name][index_i][j]
+                    last_select_index = None
+
+                # no change needs to be done, just copy the whole weight tensor
+                else:
+                    state_dict[name_base+conv_weight_name] = oriweight
+                    last_select_index = None
+
+                # conv2 of the last block of a stage
+                if k == num-1 and l == 1:
+                    br_out_index = select_index   
+
+                    # ready to load shortcut weights
+                    if br_in_index is not None:
+                        for index_i, i in enumerate(br_out_index):
+                            for index_j, j in enumerate(br_in_index):
+                                state_dict[br_weight_name][index_i][index_j] = \
+                                    oristate_dict[br_weight_name][i][j]
+                    else:
+                        for index_i, i in enumerate(br_out_index):
+                            state_dict[br_weight_name][index_i] = \
+                                oristate_dict[br_weight_name][i]
+                    # ipdb.set_trace()
+
+    for name, module in model.named_modules():
+        name = name.replace('module.', '') # remove DataParallel prefix
+
+        if isinstance(module, nn.Conv2d):
+            conv_name = name + '.weight'
+            if 'shortcut' in name:
+                continue
+            if 'br' in name:
+                continue
+            if conv_name not in all_conv_weight:
+                state_dict[name_base+conv_name] = oristate_dict[conv_name]
+
+        elif isinstance(module, nn.Linear):
+            state_dict[name_base+name + '.weight'] = oristate_dict[name + '.weight']
+            state_dict[name_base+name + '.bias'] = oristate_dict[name + '.bias']
+
+    model.load_state_dict(state_dict)
+
+def load_doublenet_bottleneck_model(model, oristate_dict, layer):
+    '''
+    load weights based on L1 metric on oristate_dict
+    '''
     cfg = {
         56: [9, 9, 9],
         110: [18, 18, 18],
@@ -312,10 +432,10 @@ def load_doublenet_model(model, oristate_dict, layer):
                 currentfilter_num = curweight.size(0)
 
                 if orifilter_num != currentfilter_num:
-                    logger.info('loading rank from: ' + prefix + str(cov_id) + subfix)
-                    rank = np.load(prefix + str(cov_id) + subfix)
+                    # logger.info('loading rank from: ' + prefix + str(cov_id) + subfix)
+                    rank = oriweight.norm(p=1, dim=[1,2,3]).cpu()
                     select_index = np.argsort(rank)[orifilter_num - currentfilter_num:]  # preserved filter id
-                    select_index.sort()
+                    select_index, _ = select_index.sort()
 
                     if last_select_index is not None:
                         for index_i, i in enumerate(select_index):
@@ -329,6 +449,7 @@ def load_doublenet_model(model, oristate_dict, layer):
 
                     last_select_index = select_index
 
+                # alter each filter based on the prune result of the previous block
                 elif last_select_index is not None:
                     for index_i in range(orifilter_num):
                         for index_j, j in enumerate(last_select_index):
@@ -336,9 +457,16 @@ def load_doublenet_model(model, oristate_dict, layer):
                                 oristate_dict[conv_weight_name][index_i][j]
                     last_select_index = None
 
+                # no change needs to be done, just copy the whole weight tensor
                 else:
                     state_dict[name_base+conv_weight_name] = oriweight
                     last_select_index = None
+
+        # load shortcut layer weights
+        br_source_weight_name = 'br' + str(layer + 1) + '.0.weight'
+        br_dest_weight_name = 'br' + str(layer + 1) + '.3.weight'
+        state_dict[br_dest_weight_name] = oristate_dict[br_source_weight_name]
+
 
     for name, module in model.named_modules():
         name = name.replace('module.', '') # remove DataParallel prefix
@@ -347,13 +475,14 @@ def load_doublenet_model(model, oristate_dict, layer):
             conv_name = name + '.weight'
             if 'shortcut' in name:
                 continue
+            if 'br' in name:
+                continue
             if conv_name not in all_conv_weight:
                 state_dict[name_base+conv_name] = oristate_dict[conv_name]
 
         elif isinstance(module, nn.Linear):
             state_dict[name_base+name + '.weight'] = oristate_dict[name + '.weight']
             state_dict[name_base+name + '.bias'] = oristate_dict[name + '.bias']
-
 
     model.load_state_dict(state_dict)
 
@@ -740,17 +869,18 @@ def main():
             origin_model = eval(args.arch)(compress_rate=[0.] * 100).cuda()
             ckpt = torch.load(args.pretrain_dir, map_location='cuda:0')
 
-            #if args.arch=='resnet_56':
-            #    origin_model.load_state_dict(ckpt['state_dict'],strict=False)
-            if args.arch == 'densenet_40' or args.arch == 'resnet_110':
-                new_state_dict = OrderedDict()
-                for k, v in ckpt['state_dict'].items():
-                    new_state_dict[k.replace('module.', '')] = v
-                origin_model.load_state_dict(new_state_dict)
-            else:
-                origin_model.load_state_dict(ckpt['state_dict'])
+            # #if args.arch=='resnet_56':
+            # #    origin_model.load_state_dict(ckpt['state_dict'],strict=False)
+            # if args.arch == 'densenet_40' or args.arch == 'resnet_110':
+            #     new_state_dict = OrderedDict()
+            #     for k, v in ckpt['state_dict'].items():
+            #         new_state_dict[k.replace('module.', '')] = v
+            #     origin_model.load_state_dict(new_state_dict)
+            # else:
+            #     origin_model.load_state_dict(ckpt['state_dict'])
 
-            oristate_dict = origin_model.state_dict()
+            # oristate_dict = origin_model.state_dict()
+            oristate_dict = ckpt['state_dict']
 
             if args.arch == 'googlenet':
                 load_google_model(model, oristate_dict)
@@ -762,8 +892,13 @@ def main():
                 load_resnet_model(model, oristate_dict, 110)
             elif args.arch == 'densenet_40':
                 load_densenet_model(model, oristate_dict)
+            elif args.arch == 'doublenet_56_indep':
+                load_doublenet_model(model, oristate_dict, 56)
+            elif args.arch == 'doublenet_56_indep_bottleneck':
+                load_doublenet_bottleneck_model(model, oristate_dict, 56)
             else:
-                raise
+                # raise
+                print('specify a supported pretrained model')
         else:
             logger.info('training from scratch')
 
@@ -774,7 +909,7 @@ def main():
     # train the model
     epoch = start_epoch
     while epoch < args.epochs:
-        train_obj, train_top1_acc,  train_top5_acc = train(epoch,  train_loader, model, criterion, optimizer, scheduler)
+        train_obj, train_top1_acc,  train_top5_acc = train(epoch,  train_loader, model, criterion, optimizer, scheduler, args)
         valid_obj, valid_top1_acc, valid_top5_acc = validate(epoch, val_loader, model, criterion, args)
 
         is_best = False
@@ -793,7 +928,7 @@ def main():
         logger.info("=>Best accuracy {:.3f}".format(best_top1_acc))#
 
 
-def train(epoch, train_loader, model, criterion, optimizer, scheduler):
+def train(epoch, train_loader, model, criterion, optimizer, scheduler, args):
     batch_time = utils.AverageMeter('Time', ':6.3f')
     data_time = utils.AverageMeter('Data', ':6.3f')
     losses = utils.AverageMeter('Loss', ':.4e')
@@ -816,12 +951,14 @@ def train(epoch, train_loader, model, criterion, optimizer, scheduler):
         # compute outputy
         logits = model(images)
         loss = criterion(logits, target)
+
         # add group lasso loss to all conv layers in each stage
-        loss_grouplasso = 0
-        for name, wt in model.named_parameters():
-            if 'conv' in name:
-                loss_grouplasso = loss_grouplasso + wt.norm(p=2, dim=[1,2,3]).sum()
-        loss = loss + 5e-2 * loss_grouplasso
+        if args.ssl:
+            loss_grouplasso = 0
+            for name, wt in model.named_parameters():
+                if 'conv' in name:
+                    loss_grouplasso = loss_grouplasso + wt.norm(p=2, dim=[1,2,3]).sum()
+            loss = loss + args.lam * loss_grouplasso
 
         # measure accuracy and record loss
         # ipdb.set_trace()
