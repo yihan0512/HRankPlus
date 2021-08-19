@@ -21,6 +21,7 @@ from models.cifar10.resnet import resnet_56, resnet_110
 from models.cifar10.googlenet import googlenet, Inception
 from models.cifar10.densenet import densenet_40
 from models.cifar10.doublenet import doublenet_56_indep, doublenet_56_indep_bottleneck, doublenet_110
+from models.cifar10.auxnet import auxnet
 
 from data import cifar10
 import utils.common as utils
@@ -51,24 +52,24 @@ parser.add_argument(
 parser.add_argument(
     '--batch_size',
     type=int,
-    default=256,
+    default=128,
     help='batch size')
 
 parser.add_argument(
     '--epochs',
     type=int,
-    default=150,
+    default=200,
     help='num of training epochs')
 
 parser.add_argument(
     '--learning_rate',
     type=float,
-    default=0.01,
+    default=0.1,
     help='init learning rate')
 
 parser.add_argument(
     '--lr_decay_step',
-    default='50,100',
+    default='100,150',
     type=str,
     help='learning rate')
 
@@ -81,7 +82,7 @@ parser.add_argument(
 parser.add_argument(
     '--weight_decay',
     type=float,
-    default=5e-4,
+    default=1e-4,
     help='weight decay')
 
 
@@ -140,6 +141,22 @@ parser.add_argument(
     type=float,
     default=0.008,
     help='coefficient for the ssl loss term')
+
+parser.add_argument(
+    '--deepnet_pretrained',
+    action='store_true',
+    help='load pretrained deepnet weights')
+
+parser.add_argument(
+    '--shortcut_pretrained',
+    action='store_true',
+    help='load pretrained shortcut weights')
+
+parser.add_argument(
+    '--criterion',
+    type=str,
+    default='hrank',
+    help='pruning criterion: l1 or hrank')
 
 args = parser.parse_args()
 
@@ -397,7 +414,7 @@ def load_doublenet_model(model, oristate_dict, layer):
 
 def load_doublenet_bottleneck_model(model, oristate_dict, layer):
     '''
-    load weights based on L1 metric on oristate_dict
+    load weights to a pruned doublnet_bottleneck model based on L1 metric on oristate_dict, conv1x1 weights are randomly inited
     '''
     cfg = {
         56: [9, 9, 9],
@@ -432,10 +449,13 @@ def load_doublenet_bottleneck_model(model, oristate_dict, layer):
                 currentfilter_num = curweight.size(0)
 
                 if orifilter_num != currentfilter_num:
-                    # logger.info('loading rank from: ' + prefix + str(cov_id) + subfix)
-                    rank = oriweight.norm(p=1, dim=[1,2,3]).cpu()
+                    if args.criterion == 'l1':
+                        rank = oriweight.norm(p=1, dim=[1,2,3]).cpu().numpy() # numpy array sort no need to assign to new variable
+                    elif args.criterion =='hrank':
+                        logger.info('loading rank from: ' + prefix + str(cov_id) + subfix)
+                        rank = np.load(prefix + str(cov_id) + subfix)
                     select_index = np.argsort(rank)[orifilter_num - currentfilter_num:]  # preserved filter id
-                    select_index, _ = select_index.sort()
+                    select_index.sort()
 
                     if last_select_index is not None:
                         for index_i, i in enumerate(select_index):
@@ -466,6 +486,98 @@ def load_doublenet_bottleneck_model(model, oristate_dict, layer):
         br_source_weight_name = 'br' + str(layer + 1) + '.0.weight'
         br_dest_weight_name = 'br' + str(layer + 1) + '.3.weight'
         state_dict[br_dest_weight_name] = oristate_dict[br_source_weight_name]
+
+
+    for name, module in model.named_modules():
+        name = name.replace('module.', '') # remove DataParallel prefix
+
+        if isinstance(module, nn.Conv2d):
+            conv_name = name + '.weight'
+            if 'shortcut' in name:
+                continue
+            if 'br' in name: # all necessary br weights are already loaded
+                continue
+            if conv_name not in all_conv_weight:
+                state_dict[name_base+conv_name] = oristate_dict[conv_name]
+
+        elif isinstance(module, nn.Linear):
+            state_dict[name_base+name + '.weight'] = oristate_dict[name + '.weight']
+            state_dict[name_base+name + '.bias'] = oristate_dict[name + '.bias']
+
+    model.load_state_dict(state_dict)
+
+def load_doublenet_model_pretrained(model, oristate_dict, layer, deepnet_pretrained, shortcut_pretrained):
+    '''
+    load pretrained weights to a full model
+    '''
+    cfg = {
+        56: [9, 9, 9],
+        110: [18, 18, 18],
+    }
+
+    state_dict = model.state_dict()
+
+    current_cfg = cfg[layer]
+    last_select_index = None
+
+    all_conv_weight = []
+    ipdb.set_trace()
+
+    cnt=1
+    for layer, num in enumerate(current_cfg):
+        layer_name = 'layer' + str(layer + 1) + '.'
+        # load deepnet weights
+        if deepnet_pretrained:
+            state_dict['conv1.weight'] = oristate_dict['conv1.weight'] # load conv1 weight
+            all_conv_weight.append('conv1.weight')
+            for k in range(num):
+                for l in range(2):
+                    cnt+=1
+                    cov_id=cnt
+
+                    conv_name = layer_name + str(k) + '.conv' + str(l + 1)
+                    conv_weight_name = conv_name + '.weight'
+                    all_conv_weight.append(conv_weight_name)
+                    oriweight = oristate_dict[conv_weight_name]
+                    curweight =state_dict[name_base+conv_weight_name]
+                    orifilter_num = oriweight.size(0)
+                    currentfilter_num = curweight.size(0)
+
+                    if orifilter_num != currentfilter_num:
+                        rank = oriweight.norm(p=1, dim=[1,2,3]).cpu()
+                        select_index = np.argsort(rank)[orifilter_num - currentfilter_num:]  # preserved filter id
+                        select_index, _ = select_index.sort()
+
+                        if last_select_index is not None:
+                            for index_i, i in enumerate(select_index):
+                                for index_j, j in enumerate(last_select_index):
+                                    state_dict[name_base+conv_weight_name][index_i][index_j] = \
+                                        oristate_dict[conv_weight_name][i][j]
+                        else:
+                            for index_i, i in enumerate(select_index):
+                                state_dict[name_base+conv_weight_name][index_i] = \
+                                    oristate_dict[conv_weight_name][i]
+
+                        last_select_index = select_index
+
+                    # alter each filter based on the prune result of the previous block
+                    elif last_select_index is not None:
+                        for index_i in range(orifilter_num):
+                            for index_j, j in enumerate(last_select_index):
+                                state_dict[name_base+conv_weight_name][index_i][index_j] = \
+                                    oristate_dict[conv_weight_name][index_i][j]
+                        last_select_index = None
+
+                    # no change needs to be done, just copy the whole weight tensor
+                    else:
+                        state_dict[name_base+conv_weight_name] = oriweight
+                        last_select_index = None
+
+        # load shortcut layer weights
+        if shortcut_pretrained:
+            br_source_weight_name = 'br' + str(layer + 1) + '.0.weight'
+            br_dest_weight_name = 'br' + str(layer + 1) + '.3.weight'
+            state_dict[br_dest_weight_name] = oristate_dict[br_source_weight_name]
 
 
     for name, module in model.named_modules():
@@ -824,7 +936,20 @@ def main():
         if os.path.isfile(args.test_model_dir):
             logger.info('loading checkpoint {} ..........'.format(args.test_model_dir))
             checkpoint = torch.load(args.test_model_dir)
-            model.load_state_dict(checkpoint['state_dict'])
+
+            # deal with the single-multi GPU problem
+            new_state_dict = OrderedDict()
+            tmp_ckpt = checkpoint['state_dict']
+            if len(args.gpu) > 1:
+                for k, v in tmp_ckpt.items():
+                    new_state_dict['module.' + k.replace('module.', '')] = v
+            else:
+                for k, v in tmp_ckpt.items():
+                    new_state_dict[k.replace('module.', '')] = v
+
+            ipdb.set_trace()
+            model.load_state_dict(new_state_dict, strict=False)
+            # model.load_state_dict(checkpoint['state_dict'])
             valid_obj, valid_top1_acc, valid_top5_acc = validate(0, val_loader, model, criterion, args)
         else:
             logger.info('please specify a checkpoint file')
@@ -896,6 +1021,8 @@ def main():
                 load_doublenet_model(model, oristate_dict, 56)
             elif args.arch == 'doublenet_56_indep_bottleneck':
                 load_doublenet_bottleneck_model(model, oristate_dict, 56)
+            elif args.arch == 'doublenet_56_indep_deepnet_pretrained':
+                load_doublenet_model_pretrained(model, oristate_dict, 56, args.deepnet_pretrained, args.shortcut_pretrained)
             else:
                 # raise
                 print('specify a supported pretrained model')
